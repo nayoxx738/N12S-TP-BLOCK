@@ -1,0 +1,519 @@
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local CoreGui = game:GetService("CoreGui")
+local StarterGui = game:GetService("StarterGui")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+
+-- ===================== POSITIONS =====================
+local flashPos = Vector3.new(-361.09, -7.17, 7.24)
+local basePos1 = Vector3.new(-352.283, -7.167, 72.350)
+local basePos2 = Vector3.new(-352.296, -7.167, 48.515)
+
+local slots = {
+    Vector3.new(-331.53, -4.71, 24.63),
+    Vector3.new(-324.45, -4.71, 23.9),
+    Vector3.new(-316.8,  -4.96, 22.6),
+    Vector3.new(-309.23, -4.71, 24.82),
+    Vector3.new(-302.05, -4.71, 24.23),
+    Vector3.new(-301.4,  -4.76, -10.51),
+    Vector3.new(-308.6,  -4.71, -10.87),
+    Vector3.new(-316.24, -4.76, -10.33),
+    Vector3.new(-323.99, -4.71, -10.63),
+    Vector3.new(-331.4,  -4.71, -10.64),
+}
+
+local selectedSlot = 1
+local autoBlockEnabled = false
+local autoGrabEnabled = false
+local autoGrabBtn = nil -- sera défini plus bas
+local IsStealing = false
+local isTping = false
+local tpDelay = 0.1
+
+-- ===================== AUTO BLOCK =====================
+local function fastClick()
+    task.wait(blockDelay)
+    local size = workspace.CurrentCamera.ViewportSize
+    -- Spam clics rapides pendant 0.5s pour être sûr que ça prend
+    local startTime = tick()
+    while tick() - startTime < 0.5 do
+        VirtualInputManager:SendMouseButtonEvent(size.X/2, size.Y/2 + 50, 0, true, game, 1)
+        VirtualInputManager:SendMouseButtonEvent(size.X/2, size.Y/2 + 50, 0, false, game, 1)
+        task.wait(0.02)
+    end
+end
+
+local function getNearestPlayer()
+    local char = player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return nil end
+    local nearest, distance = nil, math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+            local mag = (char.HumanoidRootPart.Position - p.Character.HumanoidRootPart.Position).Magnitude
+            if mag < distance then distance = mag nearest = p end
+        end
+    end
+    return nearest
+end
+
+-- ===================== AUTO GRAB =====================
+local allAnimalsCache = {}
+local PromptMemoryCache = {}
+local InternalStealCache = {}
+
+local function isMyBase(plotName)
+    local plots = workspace:FindFirstChild("Plots")
+    local plot = plots and plots:FindFirstChild(plotName)
+    if not plot then return false end
+    local sign = plot:FindFirstChild("PlotSign")
+    return sign and sign:FindFirstChild("YourBase") and sign.YourBase.Enabled
+end
+
+local function scanSinglePlot(plot)
+    if not plot or not plot:IsA("Model") or isMyBase(plot.Name) then return end
+    local podiums = plot:FindFirstChild("AnimalPodiums")
+    if not podiums then return end
+    for _, podium in ipairs(podiums:GetChildren()) do
+        if podium:IsA("Model") and podium:FindFirstChild("Base") then
+            table.insert(allAnimalsCache, {
+                plot = plot.Name,
+                slot = podium.Name,
+                worldPosition = podium:GetPivot().Position,
+                uid = plot.Name .. "_" .. podium.Name,
+            })
+        end
+    end
+end
+
+task.spawn(function()
+    local plots = workspace:WaitForChild("Plots", 15)
+    if not plots then return end
+    for _, plot in ipairs(plots:GetChildren()) do scanSinglePlot(plot) end
+    plots.ChildAdded:Connect(scanSinglePlot)
+    task.spawn(function()
+        while task.wait(5) do
+            table.clear(allAnimalsCache)
+            for _, plot in ipairs(plots:GetChildren()) do scanSinglePlot(plot) end
+        end
+    end)
+end)
+
+local function findPrompt(animal)
+    local cached = PromptMemoryCache[animal.uid]
+    if cached and cached.Parent then return cached end
+    local plots = workspace:FindFirstChild("Plots")
+    local plot = plots and plots:FindFirstChild(animal.plot)
+    local podiums = plot and plot:FindFirstChild("AnimalPodiums")
+    local podium = podiums and podiums:FindFirstChild(animal.slot)
+    if not podium then return nil end
+    local base = podium:FindFirstChild("Base")
+    local spawnObj = base and base:FindFirstChild("Spawn")
+    local attachment = spawnObj and spawnObj:FindFirstChild("PromptAttachment")
+    local prompt = attachment and attachment:FindFirstChildOfClass("ProximityPrompt")
+    if prompt then PromptMemoryCache[animal.uid] = prompt end
+    return prompt
+end
+
+local function buildGrabCallbacks(prompt)
+    if InternalStealCache[prompt] then return end
+    local data = {holdCallbacks = {}, triggerCallbacks = {}, ready = true}
+    local ok1, conns1 = pcall(getconnections, prompt.PromptButtonHoldBegan)
+    if ok1 then for _, c in ipairs(conns1) do table.insert(data.holdCallbacks, c.Function) end end
+    local ok2, conns2 = pcall(getconnections, prompt.Triggered)
+    if ok2 then for _, c in ipairs(conns2) do table.insert(data.triggerCallbacks, c.Function) end end
+    InternalStealCache[prompt] = data
+end
+
+local function getNearestAnimal()
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    local nearest, dist = nil, math.huge
+    for _, animal in ipairs(allAnimalsCache) do
+        local d = (hrp.Position - animal.worldPosition).Magnitude
+        if d < dist and d <= 200 then dist = d nearest = animal end
+    end
+    return nearest
+end
+
+local function executeAutoGrab()
+    local animal = getNearestAnimal()
+    if not animal then return end
+    -- Vide le cache pour forcer un nouveau prompt
+    InternalStealCache = {}
+    PromptMemoryCache = {}
+    local prompt = findPrompt(animal)
+    if not prompt then return end
+    buildGrabCallbacks(prompt)
+    local data = InternalStealCache[prompt]
+    if not data or not data.ready or IsStealing then return end
+    data.ready = false
+    IsStealing = true
+
+    task.spawn(function()
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not hum then IsStealing = false data.ready = true return end
+        for i = 1, 10 do
+            pcall(function()
+                for _, fn in ipairs(data.triggerCallbacks) do task.spawn(fn) end
+            end)
+        end
+
+        task.wait(0.2)
+        data.ready = true
+        IsStealing = false
+    end)
+end
+
+-- ===================== CLEANUP =====================
+if CoreGui:FindFirstChild("FlashTPGui") then CoreGui.FlashTPGui:Destroy() end
+if workspace:FindFirstChild("FlashTPESP") then workspace.FlashTPESP:Destroy() end
+
+-- ===================== ESP =====================
+local espFolder = Instance.new("Folder")
+espFolder.Name = "FlashTPESP"
+espFolder.Parent = workspace
+
+local espParts = {}
+for i, pos in ipairs(slots) do
+    local part = Instance.new("Part")
+    part.Size = Vector3.new(5, 1, 5)
+    part.Position = pos
+    part.Anchored = true
+    part.CanCollide = false
+    part.Material = Enum.Material.SmoothPlastic
+    part.Color = Color3.fromRGB(0, 0, 0)
+    part.Transparency = 1
+    part.CastShadow = false
+    part.Parent = espFolder
+
+    local bb = Instance.new("BillboardGui")
+    bb.Size = UDim2.new(0, 90, 0, 35)
+    bb.StudsOffset = Vector3.new(0, 3, 0)
+    bb.AlwaysOnTop = true
+    bb.Adornee = part
+    bb.Enabled = false
+    bb.Parent = part
+
+    local lbl = Instance.new("TextLabel", bb)
+    lbl.Size = UDim2.new(1, 0, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = "Slot " .. i
+    lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+    lbl.TextSize = 20
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextStrokeTransparency = 1
+    lbl.TextTransparency = 1
+
+    espParts[i] = {part = part, label = lbl, bb = bb}
+end
+
+local function updateESP()
+    for i, data in ipairs(espParts) do
+        local isSelected = i == selectedSlot
+        data.part.Transparency = isSelected and 0.5 or 1
+        data.bb.Enabled = isSelected
+        data.label.TextTransparency = isSelected and 0 or 1
+        data.label.TextStrokeTransparency = isSelected and 0.3 or 1
+    end
+end
+updateESP()
+
+-- ===================== GUI =====================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "FlashTPGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = CoreGui
+
+local C_BG     = Color3.fromRGB(0, 0, 0)
+local C_MID    = Color3.fromRGB(20, 20, 20)
+local C_WHITE  = Color3.fromRGB(255, 255, 255)
+local C_ACCENT = Color3.fromRGB(180, 180, 180)
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.Size = UDim2.new(0, 182, 0, 265)
+mainFrame.Position = UDim2.new(1, -197, 0.5, -139)
+mainFrame.AnchorPoint = Vector2.new(0, 0.5)
+mainFrame.BackgroundColor3 = C_BG
+mainFrame.BackgroundTransparency = 0.3
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Parent = screenGui
+
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
+
+local borderStroke = Instance.new("UIStroke", mainFrame)
+borderStroke.Thickness = 1.5
+borderStroke.Color = C_ACCENT
+borderStroke.Transparency = 0.4
+
+local borderGradient = Instance.new("UIGradient", borderStroke)
+borderGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0.00, Color3.fromRGB(150, 150, 150)),
+    ColorSequenceKeypoint.new(0.50, Color3.fromRGB(255, 255, 255)),
+    ColorSequenceKeypoint.new(1.00, Color3.fromRGB(150, 150, 150))
+})
+task.spawn(function()
+    while task.wait(0.01) do
+        borderGradient.Rotation = (borderGradient.Rotation + 2) % 360
+    end
+end)
+
+local title = Instance.new("TextLabel", mainFrame)
+title.Size = UDim2.new(1, 0, 0, 30)
+title.Position = UDim2.new(0, 0, 0, 5)
+title.BackgroundTransparency = 1
+title.Text = "N12S TP BLOCK"
+title.TextColor3 = C_WHITE
+title.TextSize = 15
+title.Font = Enum.Font.GothamBlack
+title.TextStrokeTransparency = 0.5
+title.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+
+local underline = Instance.new("Frame", mainFrame)
+underline.Size = UDim2.new(0.8, 0, 0, 1)
+underline.Position = UDim2.new(0.1, 0, 0, 37)
+underline.BackgroundColor3 = C_ACCENT
+underline.BorderSizePixel = 0
+
+local slotLabel = Instance.new("TextLabel", mainFrame)
+slotLabel.Size = UDim2.new(0.9, 0, 0, 20)
+slotLabel.Position = UDim2.new(0.05, 0, 0, 42)
+slotLabel.BackgroundTransparency = 1
+slotLabel.Text = "Slot sélectionné : 1"
+slotLabel.TextColor3 = C_WHITE
+slotLabel.TextSize = 9
+slotLabel.Font = Enum.Font.GothamMedium
+slotLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local slotButtons = {}
+for i = 1, 10 do
+    local row = i <= 5 and 0 or 1
+    local col = (i - 1) % 5
+    local btn = Instance.new("TextButton", mainFrame)
+    btn.Size = UDim2.new(0, 28, 0, 22)
+    btn.Position = UDim2.new(0, 8 + col * 33, 0, 65 + row * 26)
+    btn.Text = tostring(i)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 9
+    btn.TextColor3 = C_WHITE
+    btn.BackgroundColor3 = C_MID
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+    local s = Instance.new("UIStroke", btn)
+    s.Color = C_ACCENT s.Thickness = 1 s.Transparency = 0.5
+
+    btn.MouseButton1Click:Connect(function()
+        for _, b in ipairs(slotButtons) do b.BackgroundColor3 = C_MID end
+        btn.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+        selectedSlot = i
+        slotLabel.Text = "Slot sélectionné : " .. i
+        updateESP()
+    end)
+    slotButtons[i] = btn
+end
+slotButtons[1].BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+
+local delayLabel = Instance.new("TextLabel", mainFrame)
+delayLabel.Size = UDim2.new(0.5, 0, 0, 18)
+delayLabel.Position = UDim2.new(0.05, 0, 0, 118)
+delayLabel.BackgroundTransparency = 1
+delayLabel.Text = "Délai : " .. tpDelay .. "s"
+delayLabel.TextColor3 = C_WHITE
+delayLabel.TextSize = 8
+delayLabel.Font = Enum.Font.GothamMedium
+delayLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local minusBtn = Instance.new("TextButton", mainFrame)
+minusBtn.Size = UDim2.new(0, 25, 0, 18)
+minusBtn.Position = UDim2.new(0.55, 0, 0, 118)
+minusBtn.Text = "-"
+minusBtn.Font = Enum.Font.GothamBold
+minusBtn.TextSize = 12
+minusBtn.TextColor3 = C_WHITE
+minusBtn.BackgroundColor3 = C_MID
+Instance.new("UICorner", minusBtn).CornerRadius = UDim.new(0, 4)
+
+local plusBtn = Instance.new("TextButton", mainFrame)
+plusBtn.Size = UDim2.new(0, 25, 0, 18)
+plusBtn.Position = UDim2.new(0.55, 28, 0, 118)
+plusBtn.Text = "+"
+plusBtn.Font = Enum.Font.GothamBold
+plusBtn.TextSize = 12
+plusBtn.TextColor3 = C_WHITE
+plusBtn.BackgroundColor3 = C_MID
+Instance.new("UICorner", plusBtn).CornerRadius = UDim.new(0, 4)
+
+minusBtn.MouseButton1Click:Connect(function()
+    tpDelay = math.max(0, math.floor((tpDelay - 0.05) * 100 + 0.5) / 100)
+    delayLabel.Text = "Délai : " .. tpDelay .. "s"
+end)
+
+plusBtn.MouseButton1Click:Connect(function()
+    tpDelay = math.floor((tpDelay + 0.05) * 100 + 0.5) / 100
+    delayLabel.Text = "Délai : " .. tpDelay .. "s"
+end)
+
+local flashBtn = Instance.new("TextButton", mainFrame)
+flashBtn.Size = UDim2.new(0.9, 0, 0, 28)
+flashBtn.Position = UDim2.new(0.05, 0, 0, 143)
+flashBtn.Text = "⚡ TP BLOCK"
+flashBtn.Font = Enum.Font.GothamBold
+flashBtn.TextSize = 11
+flashBtn.TextColor3 = C_WHITE
+flashBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+Instance.new("UICorner", flashBtn).CornerRadius = UDim.new(0, 4)
+local fs = Instance.new("UIStroke", flashBtn)
+fs.Color = C_ACCENT fs.Thickness = 1 fs.Transparency = 0.3
+
+flashBtn.MouseButton1Click:Connect(function()
+    if isTping then return end
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return end
+
+    isTping = true
+    flashBtn.Text = "⚡ EN COURS..."
+    flashBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+
+    local backpack = player:FindFirstChild("Backpack")
+    if backpack then
+        local carpet = backpack:FindFirstChild("Flying Carpet")
+        if carpet then hum:EquipTool(carpet) task.wait(0.1) end
+    end
+
+    hrp.CFrame = CFrame.new(flashPos)
+    task.wait(tpDelay)
+    hrp.CFrame = CFrame.new(slots[selectedSlot])
+
+    -- Auto Block au slot
+    if autoBlockEnabled then
+        local target = getNearestPlayer()
+        if target then
+            StarterGui:SetCore("PromptBlockPlayer", target)
+            task.wait(blockDelay)
+            local size = workspace.CurrentCamera.ViewportSize
+            VirtualInputManager:SendMouseButtonEvent(size.X/2, size.Y/2 + 50, 0, true, game, 1)
+            VirtualInputManager:SendMouseButtonEvent(size.X/2, size.Y/2 + 50, 0, false, game, 1)
+        end
+    end
+
+    task.wait(tpDelay)
+    flashBtn.Text = "⚡ TP BLOCK"
+    flashBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    isTping = false
+end)
+
+local autoBlockToggle = Instance.new("TextButton", mainFrame)
+autoBlockToggle.Size = UDim2.new(0.9, 0, 0, 23)
+autoBlockToggle.Position = UDim2.new(0.05, 0, 0, 177)
+autoBlockToggle.Text = "AUTO BLOCK : OFF"
+autoBlockToggle.Font = Enum.Font.GothamBold
+autoBlockToggle.TextSize = 9
+autoBlockToggle.TextColor3 = C_WHITE
+autoBlockToggle.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+Instance.new("UICorner", autoBlockToggle).CornerRadius = UDim.new(0, 4)
+local abs = Instance.new("UIStroke", autoBlockToggle)
+abs.Color = C_ACCENT abs.Thickness = 1 abs.Transparency = 0.3
+
+autoBlockToggle.MouseButton1Click:Connect(function()
+    autoBlockEnabled = not autoBlockEnabled
+    autoBlockToggle.Text = autoBlockEnabled and "AUTO BLOCK : ON" or "AUTO BLOCK : OFF"
+    autoBlockToggle.BackgroundColor3 = autoBlockEnabled and Color3.fromRGB(60, 60, 60) or Color3.fromRGB(40, 40, 40)
+end)
+
+-- Délai du block
+local blockDelay = 0.3
+local blockDelayLabel = Instance.new("TextLabel", mainFrame)
+blockDelayLabel.Size = UDim2.new(0.5, 0, 0, 18)
+blockDelayLabel.Position = UDim2.new(0.05, 0, 0, 204)
+blockDelayLabel.BackgroundTransparency = 1
+blockDelayLabel.Text = "Délai block : " .. blockDelay .. "s"
+blockDelayLabel.TextColor3 = C_WHITE
+blockDelayLabel.TextSize = 8
+blockDelayLabel.Font = Enum.Font.GothamMedium
+blockDelayLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local blockMinus = Instance.new("TextButton", mainFrame)
+blockMinus.Size = UDim2.new(0, 25, 0, 18)
+blockMinus.Position = UDim2.new(0.55, 0, 0, 204)
+blockMinus.Text = "-"
+blockMinus.Font = Enum.Font.GothamBold
+blockMinus.TextSize = 12
+blockMinus.TextColor3 = C_WHITE
+blockMinus.BackgroundColor3 = C_MID
+Instance.new("UICorner", blockMinus).CornerRadius = UDim.new(0, 4)
+
+local blockPlus = Instance.new("TextButton", mainFrame)
+blockPlus.Size = UDim2.new(0, 25, 0, 18)
+blockPlus.Position = UDim2.new(0.55, 28, 0, 204)
+blockPlus.Text = "+"
+blockPlus.Font = Enum.Font.GothamBold
+blockPlus.TextSize = 12
+blockPlus.TextColor3 = C_WHITE
+blockPlus.BackgroundColor3 = C_MID
+Instance.new("UICorner", blockPlus).CornerRadius = UDim.new(0, 4)
+
+blockMinus.MouseButton1Click:Connect(function()
+    blockDelay = math.max(0, math.floor((blockDelay - 0.05) * 100 + 0.5) / 100)
+    blockDelayLabel.Text = "Délai block : " .. blockDelay .. "s"
+end)
+
+blockPlus.MouseButton1Click:Connect(function()
+    blockDelay = math.floor((blockDelay + 0.05) * 100 + 0.5) / 100
+    blockDelayLabel.Text = "Délai block : " .. blockDelay .. "s"
+end)
+
+autoGrabBtn = Instance.new("TextButton", mainFrame)
+autoGrabBtn.Size = UDim2.new(0.9, 0, 0, 23)
+autoGrabBtn.Position = UDim2.new(0.05, 0, 0, 230)
+autoGrabBtn.Text = "🤚 AUTO GRAB : OFF"
+autoGrabBtn.Font = Enum.Font.GothamBold
+autoGrabBtn.TextSize = 9
+autoGrabBtn.TextColor3 = C_WHITE
+autoGrabBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+Instance.new("UICorner", autoGrabBtn).CornerRadius = UDim.new(0, 4)
+local ags = Instance.new("UIStroke", autoGrabBtn)
+ags.Color = C_ACCENT ags.Thickness = 1 ags.Transparency = 0.3
+
+autoGrabBtn.MouseButton1Click:Connect(function()
+    autoGrabEnabled = not autoGrabEnabled
+    autoGrabBtn.Text = autoGrabEnabled and "🤚 AUTO GRAB : ON" or "🤚 AUTO GRAB : OFF"
+    autoGrabBtn.BackgroundColor3 = autoGrabEnabled and Color3.fromRGB(60, 60, 60) or Color3.fromRGB(40, 40, 40)
+    if autoGrabEnabled then
+        task.spawn(function()
+            while autoGrabEnabled do
+                if not IsStealing then executeAutoGrab() end
+                task.wait(0.3)
+            end
+        end)
+    end
+end)
+
+-- ===================== DRAG =====================
+local dragging, dragStart, startPos
+
+mainFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true dragStart = input.Position startPos = mainFrame.Position
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
